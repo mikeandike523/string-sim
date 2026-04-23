@@ -3,12 +3,13 @@ import '../App.css'
 import { useEffect, useRef, useCallback, useState } from "react"
 import { throttle } from "lodash"
 
-const NUM_POINTS = 100
-const DIAGRAM_HEIGHT_MM = 7
+const DIAGRAM_HEIGHT_MM = 4
+const MIN_STRING_LENGTH = 0.01
+const MAX_STRING_LENGTH = 1.5
+const CONTROL_PANEL_WIDTH = 420
+const MIN_CANVAS_WIDTH = 24
 // Physics constants needed on main thread to compute derived params for worklet
 // Must stay in sync with string-processor.js
-const STRING_TENSION = 50
-const K_SPRING = 12_000
 const BENDING_STIFFNESS = 1e-9
 
 const NODE_RADIUS = 2
@@ -22,11 +23,30 @@ const PIXELS_PER_METER_FRACTION = 0.45
 
 function computeCanvasDims(stringLength: number) {
   const ppm = window.innerWidth * PIXELS_PER_METER_FRACTION
-  const width = Math.max(120, Math.min(Math.round(ppm * stringLength), window.innerWidth - 48))
+  const width = Math.max(MIN_CANVAS_WIDTH, Math.min(Math.round(ppm * stringLength), window.innerWidth - 48))
   // Height is fixed to a comfortable fraction of the viewport — it represents
   // displacement amplitude, which is independent of string length
   const height = Math.min(Math.round(window.innerHeight * 0.30), 280)
   return { width, height }
+}
+
+function clampStringLength(length: number) {
+  return Math.max(MIN_STRING_LENGTH, Math.min(MAX_STRING_LENGTH, length))
+}
+
+function clampUnitInterval(value: number) {
+  return Math.max(0, Math.min(1, value))
+}
+
+function sliderParamToStringLength(param: number) {
+  const t = clampUnitInterval(param)
+  const logarithmicScale = (Math.pow(10, t) - 1) / 9
+  return MIN_STRING_LENGTH + (MAX_STRING_LENGTH - MIN_STRING_LENGTH) * logarithmicScale
+}
+
+function stringLengthToSliderParam(length: number) {
+  const normalizedLength = (clampStringLength(length) - MIN_STRING_LENGTH) / (MAX_STRING_LENGTH - MIN_STRING_LENGTH)
+  return clampUnitInterval(Math.log10(1 + 9 * normalizedLength))
 }
 
 export default function IndexPage() {
@@ -38,7 +58,8 @@ export default function IndexPage() {
   // Latest y-positions snapshot from worklet (or drag override)
   const latestPositionsRef = useRef<Float32Array | null>(null)
   // Local copy of last-sent positions, used for nearest-node search during drag
-  const localPositionsRef = useRef<Float32Array>(new Float32Array(NUM_POINTS))
+  const localPositionsRef = useRef<Float32Array>(new Float32Array(0))
+  const pointCountRef = useRef<number | null>(null)
   const pickupIndexRef = useRef<number>(20)
   const audioStartedRef = useRef(false)
   const gainValueRef = useRef(0.7)
@@ -49,7 +70,8 @@ export default function IndexPage() {
   const [audioStarted, setAudioStarted] = useState(false)
   const [pickupFraction, setPickupFraction] = useState(0.2)
   const [gainValue, setGainValue] = useState(0.7)
-  const [stringLength, setStringLength] = useState(1.0)
+  const [pointCount, setPointCount] = useState<number | null>(null)
+  const [stringLength, setStringLength] = useState(() => clampStringLength(1.0))
   const [slowMo, setSlowMo] = useState(1)
   const [canvasDims, setCanvasDims] = useState(() => computeCanvasDims(1.0))
 
@@ -77,14 +99,15 @@ export default function IndexPage() {
       ctx.clearRect(0, 0, width, height)
 
       const positions = latestPositionsRef.current
+      const count = positions?.length ?? pointCountRef.current ?? 0
       // Node i maps to x-fraction i/(N-1), independent of string length
-      const xFrac = (i: number) => width * (i / (NUM_POINTS - 1))
+      const xFrac = (i: number) => count <= 1 ? 0 : width * (i / (count - 1))
       const yPx = (y: number) => height / 2 - (height / 2) * (y * 1000 / (DIAGRAM_HEIGHT_MM / 2))
 
       if (positions) {
         ctx.strokeStyle = LINE_COLOR
         ctx.lineWidth = LINE_THICKNESS
-        for (let i = 0; i < NUM_POINTS - 1; i++) {
+        for (let i = 0; i < count - 1; i++) {
           ctx.beginPath()
           ctx.moveTo(xFrac(i), yPx(positions[i]))
           ctx.lineTo(xFrac(i + 1), yPx(positions[i + 1]))
@@ -92,7 +115,7 @@ export default function IndexPage() {
         }
 
         ctx.fillStyle = NODE_COLOR
-        for (let i = 0; i < NUM_POINTS; i++) {
+        for (let i = 0; i < count; i++) {
           ctx.beginPath()
           ctx.arc(xFrac(i), yPx(positions[i]), NODE_RADIUS, 0, 2 * Math.PI)
           ctx.fill()
@@ -156,10 +179,11 @@ export default function IndexPage() {
 
   // Sync pickupFraction → ref + worklet
   useEffect(() => {
-    const index = Math.max(1, Math.min(NUM_POINTS - 2, Math.round(pickupFraction * (NUM_POINTS - 1))))
+    if (pointCount == null) return
+    const index = Math.max(1, Math.min(pointCount - 2, Math.round(pickupFraction * (pointCount - 1))))
     pickupIndexRef.current = index
     workletNodeRef.current?.port.postMessage({ type: 'set_pickup', index })
-  }, [pickupFraction])
+  }, [pickupFraction, pointCount])
 
   // Sync gainValue → ref + GainNode
   useEffect(() => {
@@ -183,23 +207,31 @@ export default function IndexPage() {
     gainNode.connect(audioCtx.destination)
 
     workletNode.port.onmessage = (e: MessageEvent) => {
-      if (e.data.type === 'visual_update') {
-        latestPositionsRef.current = e.data.positions as Float32Array
+      if (e.data.type === 'config') {
+        const nextPointCount = e.data.numPoints as number
+        pointCountRef.current = nextPointCount
+        localPositionsRef.current = new Float32Array(nextPointCount)
+        latestPositionsRef.current = null
+        pickupIndexRef.current = Math.max(1, Math.min(nextPointCount - 2, Math.round(pickupFraction * (nextPointCount - 1))))
+        workletNode.port.postMessage({ type: 'set_pickup', index: pickupIndexRef.current })
+        if (slowMoRef.current !== 1) {
+          workletNode.port.postMessage({ type: 'set_slowmo', value: slowMoRef.current })
+        }
+        const segLength = stringLengthRef.current / (nextPointCount - 1)
+        workletNode.port.postMessage({
+          type: 'set_params',
+          segLength,
+          bendingForceCoeff: BENDING_STIFFNESS / Math.pow(segLength, 3),
+        })
+        setPointCount(nextPointCount)
+      } else if (e.data.type === 'visual_update') {
+        const positions = e.data.positions as Float32Array
+        latestPositionsRef.current = positions
+        if (localPositionsRef.current.length === positions.length) {
+          localPositionsRef.current.set(positions)
+        }
       }
     }
-
-    // Sync current slider values to worklet
-    workletNode.port.postMessage({ type: 'set_pickup', index: pickupIndexRef.current })
-    if (slowMoRef.current !== 1) {
-      workletNode.port.postMessage({ type: 'set_slowmo', value: slowMoRef.current })
-    }
-    const sl = stringLengthRef.current
-    const segLength = sl / (NUM_POINTS - 1)
-    workletNode.port.postMessage({
-      type: 'set_params',
-      segLength,
-      bendingForceCoeff: BENDING_STIFFNESS / Math.pow(segLength, 3),
-    })
 
     audioCtxRef.current = audioCtx
     workletNodeRef.current = workletNode
@@ -209,32 +241,32 @@ export default function IndexPage() {
   }, [])
 
   const handleStringLengthChange = useCallback((newLength: number) => {
-    stringLengthRef.current = newLength
-    setStringLength(newLength)
+    const clampedLength = clampStringLength(newLength)
+    stringLengthRef.current = clampedLength
+    setStringLength(clampedLength)
     updateCanvasSize()
 
-    const segLength = newLength / (NUM_POINTS - 1)
+    if (pointCountRef.current == null) return
+    const segLength = clampedLength / (pointCountRef.current - 1)
     workletNodeRef.current?.port.postMessage({
       type: 'set_params',
       segLength,
       bendingForceCoeff: BENDING_STIFFNESS / Math.pow(segLength, 3),
     })
-
-    // After reset, show flat string (not null) so the canvas doesn't revert to idle text
-    localPositionsRef.current.fill(0)
-    latestPositionsRef.current = audioStartedRef.current ? new Float32Array(NUM_POINTS) : null
   }, [updateCanvasSize])
 
   // Compute triangle pluck positions for the given pointer coordinates.
   // Uses localPositionsRef (last-sent state) for the nearest-node distance search.
   const computePluckPositions = useCallback((pointerX: number, pointerY: number): Float32Array => {
     const canvas = canvasRef.current
-    const positions = new Float32Array(NUM_POINTS)
+    const count = pointCountRef.current
+    if (count == null) return new Float32Array(0)
+    const positions = new Float32Array(count)
     if (!canvas) return positions
 
     const { width, height, left, top } = canvas.getBoundingClientRect()
     const L = stringLengthRef.current
-    const segLength = L / (NUM_POINTS - 1)
+    const segLength = L / (count - 1)
     const pointerWorldX = ((pointerX - left) / width) * L
     const pointerWorldY = ((height / 2 - (pointerY - top)) / (height / 2)) * (DIAGRAM_HEIGHT_MM / 1000 / 2)
     const clampedY = Math.max(
@@ -246,7 +278,7 @@ export default function IndexPage() {
     let nearestIndex = 1
     let nearestDist = Infinity
 
-    for (let i = 1; i < NUM_POINTS - 1; i++) {
+    for (let i = 1; i < count - 1; i++) {
       const d = Math.sqrt(
         (segLength * i - pointerWorldX) ** 2 +
         (currentY[i] - clampedY) ** 2
@@ -258,7 +290,7 @@ export default function IndexPage() {
     }
 
     const apexY = clampedY
-    const lastIdx = NUM_POINTS - 1
+    const lastIdx = count - 1
 
     for (let i = 0; i <= nearestIndex; i++) {
       positions[i] = nearestIndex === 0 ? 0 : (i / nearestIndex) * apexY
@@ -280,7 +312,7 @@ export default function IndexPage() {
 
     // Transfer copies to worklet (zero-copy via Transferable)
     const posCopy = new Float32Array(positions)
-    const velCopy = new Float32Array(NUM_POINTS)
+    const velCopy = new Float32Array(positions.length)
     workletNode.port.postMessage(
       { type: 'pluck', positions: posCopy, velocities: velCopy },
       [posCopy.buffer, velCopy.buffer]
@@ -289,8 +321,6 @@ export default function IndexPage() {
     localPositionsRef.current.set(positions)
     latestPositionsRef.current = positions
   }, [])
-
-  const controlsWidth = Math.max(280, canvasDims.width)
 
   return (
     <Div
@@ -338,17 +368,17 @@ export default function IndexPage() {
         flexDirection="column"
         gap="8px"
         fontSize="14px"
-        style={{ width: controlsWidth }}
+        style={{ width: CONTROL_PANEL_WIDTH, maxWidth: 'calc(100vw - 32px)' }}
       >
         <Div display="flex" alignItems="center" gap="8px">
           <label style={{ width: 80, color: '#555' }}>Length</label>
           <input
             type="range"
-            min={Math.log10(0.1)}
-            max={Math.log10(5)}
-            step={0.005}
-            value={Math.log10(stringLength)}
-            onChange={(e) => handleStringLengthChange(Math.pow(10, parseFloat(e.target.value)))}
+            min={0}
+            max={1}
+            step={0.001}
+            value={stringLengthToSliderParam(stringLength)}
+            onChange={(e) => handleStringLengthChange(sliderParamToStringLength(parseFloat(e.target.value)))}
             style={{ flex: 1 }}
           />
           <span style={{ width: 44, textAlign: 'right', color: '#555', fontVariantNumeric: 'tabular-nums' }}>
