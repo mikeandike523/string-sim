@@ -4,13 +4,13 @@ import { useEffect, useRef, useCallback, useState } from "react"
 import { throttle } from "lodash"
 
 const DIAGRAM_HEIGHT_MM = 4
-const MIN_STRING_LENGTH = 0.01
+const MIN_STRING_LENGTH = 0.02
 const MAX_STRING_LENGTH = 1.5
 const CONTROL_PANEL_WIDTH = 420
 const MIN_CANVAS_WIDTH = 24
 // Physics constants needed on main thread to compute derived params for worklet
 // Must stay in sync with string-processor.js
-const BENDING_STIFFNESS = 1e-9
+const BENDING_STIFFNESS = 3e-8
 
 const NODE_RADIUS = 2
 const LINE_THICKNESS = 3

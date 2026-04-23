@@ -1,6 +1,6 @@
 'use strict';
 
-const NUM_POINTS = 100;
+const NUM_POINTS = 50;
 const STRING_MASS = 3e-3;    // kg  (was 4.5e-3; lighter → higher pitch)
 const INITIAL_STRING_LENGTH = 1;
 const STRING_TENSION = 40;   // N   (was 15; tighter → higher pitch)
